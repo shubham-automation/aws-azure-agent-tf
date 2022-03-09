@@ -1,0 +1,292 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Version 1.0.0; Agent stack
+Parameters:
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID
+    Default: ami-02354e95b39ca8dec
+  InstanceType:
+    Type: String
+    Description: Instance type
+    Default: t3.medium
+  spots:
+    Type: String
+    Description: spot instances true or false
+    Default: "false"
+  spotprice:
+    Type: String
+    Description: spotprice
+    Default: "0.00"
+  pat:
+    Type: String
+    Description: access token from ADO
+    Default: <PAT HERE>
+  role:
+    Type: String
+    Description: What role for this agent, ( eg what AWS account)
+    Default: default
+  where:
+    Type: String
+    Description: What location for this agent, ( eg what AWS account)
+    default: aws
+  what:
+    Type: String
+    Description: What environment for this agent, ( eg what AWS account)
+    default: dev
+  vpcid:
+    Type: String
+    Description: "VPC for this account"
+  restarter:
+    Type: String
+    Description: "for rolling deploys"
+    Default: default
+  awsaccount:
+    Type: String
+    Description: aws
+  poolname:
+    Type: String
+    Description: ADO poolname
+    Default: <POOL NAME HERE>
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair
+    Default: <KEY NAME HERE>
+  RootVolumeSize:
+    Type: String
+    Description: Root volume size in GB
+    Default: "50"
+  ServerSubnetIds:
+    Type: String
+    Description: Subnet Ids
+    Default: <SUBNETS HERE, comma delimited. eg subnet-024423f981a1a1da1,subnet-032c332fd4f9e23f4
+Conditions:
+  usespots: !Equals
+    - !Ref "spots"
+    - "true"
+Mappings: {}
+Resources:
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Join
+        - ""
+        - - userServiceRoleInstanceProfile-
+          - !Ref "AWS::StackName"
+      Path: /
+      Roles:
+        - !Ref "ec2Role"
+  ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+        - ""
+        - - userServiceRoleec2-
+          - !Ref "AWS::StackName"
+      PermissionsBoundary: !Sub
+        - arn:aws:iam::${account}:policy/mskDevPowerUserBoundary
+        - account: !Ref "awsaccount"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+  AgentPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: userServiceRoleBuildAgent
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - ecs:*
+              - logs:*
+              - ecr:*
+              - cloudformation:*
+              - iam:*
+              - ec2:*
+              - eks:*
+              - elasticloadbalancing:*
+              - kms:Get*
+              - kms:List*
+              - kms:Decrypt
+              - kms:Describe*
+            Resource:
+              - "*"
+      Roles:
+        - !Ref "ec2Role"
+  SSHSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ssh to test
+      VpcId: !Ref "vpcid"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      Tags:
+        - Key: Name
+          PropagateAtLaunch: true
+          Value: !Ref "AWS::StackName"
+      VPCZoneIdentifier:
+        - !Ref "ServerSubnetIds"
+      LaunchConfigurationName: !Ref "ServerLaunchConfig"
+      MinSize: "1"
+      MaxSize: "2"
+      DesiredCapacity: "1"
+    UpdatePolicy:
+      AutoScalingScheduledAction:
+        IgnoreUnmodifiedGroupSizeProperties: 'true'
+      AutoScalingRollingUpdate:
+        MinInstancesInService: '1'
+        MaxBatchSize: '2'
+        WaitOnResourceSignals: 'true'
+        PauseTime: PT10M
+  ServerLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              docker: []
+          commands:
+            a-start-docker:
+              command: service docker start
+            b-install-agents:
+              command: /tmp/build_agent_setup
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ServerLaunchConfig.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init --verbose --stack=${AWS::StackName} --region=${AWS::Region} --resource=ServerLaunchConfig
+                runas=root
+
+            /tmp/build_agent_setup:
+              content: !Sub >
+                #!/bin/bash
+
+                set -e
+
+
+                #echo -e "\n==== Trusting MSK Root CAs ===="
+
+                echo "==== Stopping Active Containers ===="
+
+                AGENT_1=azure-agent-1
+
+                AGENT_2=azure-agent-2
+
+                docker stop $AGENT_1 && docker rm $AGENT_1
+
+                docker stop $AGENT_2 && docker rm $AGENT_2
+
+                echo "==== Starting Agent 1 ===="
+
+                docker run -d
+                --name=$AGENT_1
+                --restart always
+                -e WHERE=${where}
+                -e ${where}=TRUE
+                -e ENV=${what}
+                -e ROLE=${role}
+                -e AZP_AGENT_NAME=${where}-${what}-$RANDOM
+                -e AZP_TOKEN=${pat}
+                -e AZP_URL=https://dev.azure.com/MSKDevOps
+                -e AZP_POOL=${poolname}
+                -v /var/run/docker.sock:/var/run/docker.sock
+                emberstack/azure-pipelines-agent
+
+                echo "==== Starting Agent 2 ===="
+
+                docker run -d
+                --name=$AGENT_2
+                --restart always
+                -e AZP_AGENT_NAME=${where}-${what}-$RANDOM
+                -e WHERE=${where}
+                -e ${where}=TRUE
+                -e ENV=${what}
+                -e ROLE=${role}
+                -e AZP_TOKEN=${pat}
+                -e AZP_URL=https://dev.azure.com/MSKDevOps
+                -e AZP_POOL=${poolname}
+                -v /var/run/docker.sock:/var/run/docker.sock
+                emberstack/azure-pipelines-agent
+
+                echo "==== Report: Containers Running ===="
+
+                docker ps -a --format "{{.Names}} - OK"
+
+              owner: root
+              group: root
+              mode: "000740"
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+    Properties:
+      IamInstanceProfile: !Ref "InstanceProfile"
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref "RootVolumeSize"
+      InstanceType: !Ref "InstanceType"
+      ImageId: !Ref "AmiId"
+      KeyName: !Ref "KeyName"
+      SecurityGroups:
+        - !Ref "SSHSecurityGroup"
+      SpotPrice: !If
+        - usespots
+        - !Ref "spotprice"
+        - !Ref "AWS::NoValue"
+      AssociatePublicIpAddress: false
+      UserData: !Base64
+        Fn::Join:
+          - ""
+          - - "#!/bin/bash -xe\n"
+            - "yum install -y aws-cfn-bootstrap\n"
+            - "# Install the files and packages from the metadata\n"
+            - "/opt/aws/bin/cfn-init -v "
+            - "         --stack "
+            - !Ref "AWS::StackName"
+            - "         --resource ServerLaunchConfig"
+            - "         --region "
+            - !Ref "AWS::Region"
+            - "\n"
+            - "echo '"
+            - !Ref "restarter"
+            - "'\n"
+            - "/opt/aws/bin/cfn-signal  "
+            - "            --stack "
+            - !Ref "AWS::StackName"
+            - "           --region "
+            - !Ref "AWS::Region"
+            - "         --resource AutoScalingGroup"
+            - "\n"
+Outputs: {}

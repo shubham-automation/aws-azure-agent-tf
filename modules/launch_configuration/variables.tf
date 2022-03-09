@@ -1,0 +1,11 @@
+variable "instance_type" {}
+variable "ebs_volume_size" {}
+variable "security_group_id" {}
+variable "instance_profile_name" {}
+variable "ssh_key_name" {}
+variable "cloud" {}
+variable "environment" {}
+variable "azure_agent_role" {}
+variable "pat" {}
+variable "ado_url" {}
+variable "pool_name" {}
